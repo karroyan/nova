@@ -1,0 +1,67 @@
+.venv/
+*.pyc
+dev-ignore/
+report.md
+eval_bundle/
+*.DS_Store
+
+**/docs/
+
+# Secrets
+.env
+
+# Claude
+.claude/
+CLAUDE.md
+openebm/elm/.claude/
+openebm/elm/CLAUDE.md
+openebm/dlm/mdlm/.claude/
+openebm/dlm/mdlm/CLAUDE.md
+
+# Pycache
+__pycache__/
+openebm/elm/__pycache__/
+openebm/elm/nanolightning/__pycache__/
+openebm/dlm/mdlm/__pycache__/
+openebm/dlm/mdlm/outputs/
+
+# Logs
+wandb/
+openebm/elm/logs/
+openebm/elm/lightning_logs/
+*.log
+logs/
+
+# Temporary / Backup files
+tmp/
+tmp_*/
+**/tmp/
+**/tmp_*/
+**/backup/
+**/bkp/
+*.bak
+*.bkp
+*.tmp
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.png
+*.jpg
+*.jpeg
+
+# Externel code
+nanochat/nanochat/external/
+
+# User prompts
+prompt/
+
+# uv
+uv.lock
+openebm/elm/uv.lock
+openebm/dlm/mdlm/uv.lock
+
+
+
+
