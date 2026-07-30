@@ -25,6 +25,7 @@ import sys
 import time
 import asyncio
 import logging
+import threading
 import torch
 from contextlib import asynccontextmanager, nullcontext
 from typing import Optional, List, Dict, Any, AsyncGenerator
@@ -60,7 +61,16 @@ parser.add_argument('--override-alpha', type=float, default=None)
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
 parser.add_argument('--device', type=str, default='cuda', help='设备')
 parser.add_argument('--port', type=int, default=8000, help='服务端口')
+parser.add_argument('--load-workers', type=int, default=0,
+                    help='内置 GPU 压测 worker 数（直接调引擎，不走 HTTP；建议 = GPU数*2）')
+parser.add_argument('--load-reserve', type=int, default=1,
+                    help='为真实用户保留的 GPU 数（压测最多占用 num_gpus - load_reserve 个引擎，默认 1）')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='绑定地址')
+parser.add_argument('--num-gpus', type=int, default=1, help='并发模型实例数（每实例占一张 GPU）')
+parser.add_argument('--batch-size', type=int, default=4,
+                    help='每 GPU 批处理并发请求数（bsz，建议 4-8，越大 GPU 利用率越高）')
+parser.add_argument('--batch-wait-ms', type=float, default=50.0,
+                    help='批次收集窗口（毫秒），窗口内请求凑满 batch-size 则立即发射')
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -405,12 +415,250 @@ class EBTChatEngine:
                 eos_reached |= (~input_text_mask[:, cur_pos]) & is_stop
                 prev_pos = cur_pos
 
-                if all(eos_reached):
+                tok_id, eos_val = next_token.item(), eos_reached[0].item()  # bsz=1，2次sync→不变
+                if eos_val:
                     break
 
-                token_text = self.tokenizer.decode([next_token.item()], skip_special_tokens=True)
+                token_text = self.tokenizer.decode([tok_id], skip_special_tokens=True)
                 if token_text:
                     yield token_text
+
+
+    def _encode_messages_to_tokens(self, messages: list) -> list:
+        """将多轮对话编码为 token ID 列表（从 generate_stream_multi_turn 中提取）。"""
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)
+        if inner_tok is not None and hasattr(inner_tok, 'render_for_completion'):
+            conversation = {"messages": messages + [{"role": "assistant", "content": ""}]}
+            return inner_tok.render_for_completion(conversation)
+        elif inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+            bos_id = inner_tok.get_bos_token_id()
+            user_start = inner_tok.encode_special("<|user_start|>")
+            user_end = inner_tok.encode_special("<|user_end|>")
+            asst_start = inner_tok.encode_special("<|assistant_start|>")
+            asst_end = inner_tok.encode_special("<|assistant_end|>")
+            toks = [bos_id]
+            for msg in messages:
+                if msg["role"] == "user":
+                    toks.append(user_start)
+                    toks.extend(inner_tok.encode(msg["content"]))
+                    toks.append(user_end)
+                elif msg["role"] == "assistant":
+                    toks.append(asst_start)
+                    toks.extend(inner_tok.encode(msg["content"]))
+                    toks.append(asst_end)
+            toks.append(asst_start)
+            return toks
+        else:
+            last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+            encoded = self.tokenizer.encode(last_user)
+            toks = encoded if isinstance(encoded, list) else encoded.tolist()
+            bos_id = getattr(self.tokenizer, 'bos_token_id', None)
+            if bos_id is not None and (not toks or toks[0] != bos_id):
+                toks = [bos_id] + toks
+            return toks
+
+    def generate_batch(self, batch_messages: list, max_tokens: int = 512,
+                       temperature: float = 0.8, top_p: float = 0.9):
+        """
+        批量生成：将 bsz 个对话请求打包为一次 forward pass，
+        每步 yield List[str]（每个序列产出的 token，EOS 后补空串）。
+        使用左填充使所有序列在同一位置开始生成。
+        """
+        all_prompt_tokens = [self._encode_messages_to_tokens(msgs) for msgs in batch_messages]
+        bsz = len(all_prompt_tokens)
+        prompt_lens = [len(t) for t in all_prompt_tokens]
+        max_prompt_len = max(prompt_lens)
+
+        pad_id = getattr(self.tokenizer, 'bos_token_id', 0) or 0
+        ctx_len = getattr(self.hparams, 'context_length', getattr(self.hparams, 'max_seq_len', 2048))
+        total_len = min(ctx_len, max_tokens + max_prompt_len)
+
+        # 左填充：所有序列内容右对齐于 max_prompt_len，统一从该位置开始生成
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=self.device)
+        input_text_mask = torch.zeros(bsz, total_len, dtype=torch.bool, device=self.device)
+        for i, (pt, plen) in enumerate(zip(all_prompt_tokens, prompt_lens)):
+            start = max_prompt_len - plen
+            tokens[i, start:max_prompt_len] = torch.tensor(pt, dtype=torch.long, device=self.device)
+            input_text_mask[i, :max_prompt_len] = True   # 含左填充区域，防止在此生成
+
+        inner_tok = getattr(self.tokenizer, 'tokenizer', None)
+        stop_token_ids = set()
+        if inner_tok is not None and hasattr(inner_tok, 'encode_special'):
+            for special in ("<|assistant_end|>", "<|assistant_start|>", "<|user_start|>", "<|user_end|>"):
+                sid = inner_tok.encode_special(special)
+                if sid is not None:
+                    stop_token_ids.add(sid)
+        if not stop_token_ids:
+            stop_token_ids.add(pad_id)
+
+        prev_pos = 0
+        eos_reached = torch.zeros(bsz, dtype=torch.bool, device=self.device)
+        stop_ids_t = (torch.tensor(list(stop_token_ids), dtype=torch.long, device=self.device)
+                      if stop_token_ids else None)
+
+        with torch.no_grad():
+            for cur_pos in range(max_prompt_len, total_len):
+                input_tokens = tokens[:, :cur_pos]
+                logits = call_model_forward_decode(self.hparams, self.model, input_tokens, prev_pos, bsz)
+
+                if temperature > 0:
+                    probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                    next_token = sample_top_p(probs, top_p)
+                else:
+                    next_token = torch.argmax(logits[:, -1], dim=-1)
+
+                next_token = next_token.reshape(-1)
+                next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+                tokens[:, cur_pos] = next_token
+
+                if stop_ids_t is not None:
+                    is_stop = (next_token.unsqueeze(1) == stop_ids_t).any(dim=1)
+                else:
+                    is_stop = torch.zeros(bsz, dtype=torch.bool, device=self.device)
+                eos_reached |= (~input_text_mask[:, cur_pos]) & is_stop
+                prev_pos = cur_pos
+
+                # 一次 CPU 传输取得所有需要的信息，避免逐元素 GPU sync
+                cpu = torch.stack([next_token.long(), eos_reached.long()]).cpu()  # 1 次 sync
+                next_tok_list = cpu[0].tolist()
+                eos_list = cpu[1].tolist()
+
+                if all(eos_list):   # 纯 Python，无 GPU sync
+                    break
+
+                token_texts = [
+                    '' if eos_list[i] else
+                    self.tokenizer.decode([next_tok_list[i]], skip_special_tokens=True)
+                    for i in range(bsz)
+                ]
+                yield token_texts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BatchScheduler: 每 GPU 一个，将并发请求合并为单次批量 forward pass
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BatchScheduler:
+    """
+    收集 max_batch 个并发请求（或等候 wait_ms 超时），
+    合并为一次 bsz=N 的 generate_batch 调用，
+    再将 tokens 路由回各自的 SSE 流。
+    """
+
+    def __init__(self, engine: EBTChatEngine, max_batch: int = 4, wait_ms: float = 50.0):
+        self._engine = engine
+        self._max_batch = max_batch
+        self._wait_s = wait_ms / 1000.0
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._task: Optional[asyncio.Task] = None
+
+    @property
+    def device(self):
+        return self._engine.device
+
+    def start(self):
+        self._task = asyncio.create_task(self._batch_loop())
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def generate(self, messages: list, max_tokens: int,
+                       temperature: float, top_p: float):
+        """提交一个请求，异步 yield 流式 token。"""
+        out_q: asyncio.Queue = asyncio.Queue()
+        await self._queue.put((messages, max_tokens, temperature, top_p, out_q))
+        while True:
+            item = await out_q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    async def _collect_batch(self) -> list:
+        """等第一个请求到达，再贪心收满或到超时，立即返回不浪费 GPU。"""
+        loop = asyncio.get_event_loop()
+        first = await self._queue.get()
+        batch = [first]
+        # 队列里已有足够请求时，直接 get_nowait 收满，跳过 wait_ms
+        while len(batch) < self._max_batch:
+            try:
+                batch.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if len(batch) >= self._max_batch:
+            return batch
+        # 未凑满时才进入短暂等待窗口
+        deadline = loop.time() + self._wait_s
+        while len(batch) < self._max_batch:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                batch.append(item)
+            except asyncio.TimeoutError:
+                break
+        return batch
+
+    async def _batch_loop(self):
+        """流水线：GPU 执行当前 batch 时，同步预收集下一个 batch，消除 GPU 空闲间隙。"""
+        loop = asyncio.get_event_loop()
+        # 预收集第一个 batch
+        next_collect = asyncio.create_task(self._collect_batch())
+        while True:
+            batch = await next_collect
+            # 立即开始收集下下个 batch（与 GPU 执行并行）
+            next_collect = asyncio.create_task(self._collect_batch())
+            # 执行当前 batch（阻塞直到 GPU 完成）
+            await self._run_batch(batch, loop)
+
+    async def _run_batch(self, batch: list, loop: asyncio.AbstractEventLoop):
+        out_qs = [item[4] for item in batch]
+        all_messages = [item[0] for item in batch]
+        max_tokens = max(item[1] for item in batch)
+        temperature = batch[0][2]
+        top_p = batch[0][3]
+
+        token_q: asyncio.Queue = asyncio.Queue()
+
+        def run_gen():
+            try:
+                for token_list in self._engine.generate_batch(
+                        all_messages, max_tokens=max_tokens,
+                        temperature=temperature, top_p=top_p):
+                    loop.call_soon_threadsafe(token_q.put_nowait, token_list)
+            except Exception as exc:
+                loop.call_soon_threadsafe(token_q.put_nowait, RuntimeError(str(exc)))
+            finally:
+                loop.call_soon_threadsafe(token_q.put_nowait, None)
+
+        t = threading.Thread(target=run_gen, daemon=True)
+        t.start()
+        n = len(batch)
+        try:
+            while True:
+                item = await token_q.get()
+                if item is None:
+                    break
+                if isinstance(item, RuntimeError):
+                    for q in out_qs:
+                        q.put_nowait(item)
+                    break
+                for i in range(n):
+                    if item[i]:
+                        out_qs[i].put_nowait(item[i])
+        finally:
+            for q in out_qs:
+                q.put_nowait(None)
+            t.join(timeout=30)
+        logger.info(f"[BATCH] device={self._engine.device} bsz={n} "
+                    f"max_tokens={max_tokens} scheduler_q={self._queue.qsize()}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -419,7 +667,7 @@ class EBTChatEngine:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 # ── 运行时可调参数 (通过 /command API 修改) ──
@@ -429,8 +677,10 @@ runtime_config = {
     "max_tokens": args.max_tokens,
 }
 
-# ── 全局锁: EBT 模型同一时刻只能处理一个请求 ──
-generate_lock = asyncio.Lock()
+# ── 调度器列表: 每 GPU 一个 BatchScheduler，在 lifespan 中初始化 ──
+_schedulers: List["BatchScheduler"] = []
+_sched_idx: int = 0          # round-robin 计数器（原子更新无竞争，asyncio 单线程）
+engine_pool: asyncio.Queue   # 兼容旧代码（load/status 等接口），lifespan 中初始化
 
 
 class ChatMessage(BaseModel):
@@ -447,31 +697,138 @@ class CommandRequest(BaseModel):
     command: str
 
 
+_LOAD_PROMPTS = [
+    "请写一首关于春天的七言律诗，要求平仄合律，意境优美。",
+    "用费曼技巧解释量子纠缠现象，假设对方是高中生。",
+    "写一段 Python 代码，实现归并排序并附带时间复杂度分析。",
+    "描述工业革命对19世纪欧洲社会结构的深远影响。",
+    "给我三个关于人工智能伦理的核心争论，并分析各方立场。",
+    "解释贝叶斯定理，并给出一个医学诊断中的实际应用案例。",
+    "写一个简短的科幻故事，主题是'意识上传到数字世界后的困境'。",
+    "解释为什么快速排序在实践中比堆排序更快，尽管两者都是 O(n log n)。",
+    "讨论气候变化对全球粮食安全的三个主要威胁及可能的应对策略。",
+    "用通俗语言解释 Transformer 中注意力机制的核心原理。",
+    "写一段对话：一个哲学家和一个物理学家争论'时间是否存在'。",
+    "解释 TCP 三次握手的原理，以及为什么不能用两次握手。",
+    "描述深度学习中梯度消失问题的原因及常用解决方案。",
+    "分析第一次世界大战爆发的深层原因。",
+    "解释 HTTPS 中 TLS 握手的完整过程，包括证书验证和密钥交换。",
+    "解释卡尔曼滤波的基本原理及其在自动驾驶中的应用。",
+    "设计一个微服务架构，说明服务发现和负载均衡如何实现。",
+    "解释为什么人类对损失的敏感度高于对等量收益的敏感度（前景理论）。",
+    "写一段 C++ 代码实现线程安全的生产者-消费者队列。",
+    "解释黎曼猜想的基本内容，以及它为什么如此重要。",
+]
+
+
+# 压测运行门控：set=运行，clear=暂停（所有 worker 阻塞在 wait()）
+_load_run_gate: Optional[asyncio.Event] = None
+
+
+async def _builtin_load_worker(worker_id: int, schedulers: list,
+                               stop: asyncio.Event):
+    """直接向 BatchScheduler 提交请求的内置压测 worker。
+    不走 HTTP，完全绕开代理。请求经调度器聚合后批量执行，自动拉高 GPU 利用率。"""
+    import random
+    rng = random.Random(worker_id * 7919)
+    req_count = 0
+
+    while not stop.is_set():
+        await _load_run_gate.wait()
+        if stop.is_set():
+            break
+
+        prompt = rng.choice(_LOAD_PROMPTS)
+        messages = [{"role": "user", "content": prompt}]
+
+        # round-robin 选调度器（与用户请求共享，帮助填满 batch）
+        sched = schedulers[worker_id % len(schedulers)]
+
+        t0 = time.time()
+        ntok = 0
+        try:
+            async for tok in sched.generate(messages, max_tokens=512,
+                                             temperature=0.8, top_p=0.9):
+                ntok += 1
+        except Exception as exc:
+            logger.warning(f"[LOAD-W{worker_id:02d}] gen error: {exc}")
+
+        elapsed = time.time() - t0
+        req_count += 1
+        logger.info(f"[LOAD-W{worker_id:02d}] req#{req_count}  {ntok}tok  "
+                    f"{elapsed:.1f}s  {ntok/max(elapsed,0.1):.0f}tok/s  "
+                    f"sched={sched.device}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时加载模型"""
+    """启动时加载模型，每 GPU 一个实例，每实例绑定一个 BatchScheduler。"""
+    global _schedulers, engine_pool
+    num_gpus = args.num_gpus
+    batch_size = args.batch_size
+    batch_wait_ms = args.batch_wait_ms
     print("=" * 70)
-    print("EBT Web Chat Server - 正在初始化...")
+    print(f"EBT Web Chat Server - 正在初始化 {num_gpus} 个模型实例 "
+          f"(batch_size={batch_size}, wait={batch_wait_ms:.0f}ms) ...")
     print("=" * 70)
 
     dtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
     torch.set_float32_matmul_precision('medium')
 
-    app.state.engine = EBTChatEngine(
-        checkpoint_path=args.checkpoint,
-        tokenizer_path=args.tokenizer,
-        device=args.device,
-        dtype=dtype,
-        show_mcmc=args.show_mcmc,
-        verbose=args.verbose,
-        show_energy=args.show_energy,
-        show_distribution=args.show_distribution,
-        override_mcmc_steps=args.override_mcmc_steps,
-        override_noise_std=args.override_noise_std,
-        override_alpha=args.override_alpha,
-    )
-    print(f"\n✓ EBT Web Chat Server ready at http://0.0.0.0:{args.port}")
+    engine_pool = asyncio.Queue()   # 兼容 /load/status 接口
+    _schedulers = []
+    for i in range(num_gpus):
+        device = f"cuda:{i}" if args.device == 'cuda' else args.device
+        print(f"\n[{i+1}/{num_gpus}] 加载模型到 {device} ...")
+        engine = EBTChatEngine(
+            checkpoint_path=args.checkpoint,
+            tokenizer_path=args.tokenizer,
+            device=device,
+            dtype=dtype,
+            show_mcmc=args.show_mcmc,
+            verbose=args.verbose,
+            show_energy=args.show_energy,
+            show_distribution=args.show_distribution,
+            override_mcmc_steps=args.override_mcmc_steps,
+            override_noise_std=args.override_noise_std,
+            override_alpha=args.override_alpha,
+        )
+        engine_pool.put_nowait(engine)  # 兼容接口
+        sched = BatchScheduler(engine, max_batch=batch_size, wait_ms=batch_wait_ms)
+        _schedulers.append(sched)
+
+    # 保留一个引擎引用供 /status /command 等管理接口使用
+    app.state.engine = engine_pool._queue[0]
+
+    # 启动每个调度器的 batch_loop 协程
+    for sched in _schedulers:
+        sched.start()
+
+    print(f"\n✓ EBT Web Chat Server ready at http://0.0.0.0:{args.port}  "
+          f"({num_gpus} GPU × bsz={batch_size})")
+
+    # 内置 GPU 压测 worker
+    _load_stop = asyncio.Event()
+    _load_tasks = []
+    if args.load_workers > 0:
+        global _load_run_gate
+        _load_run_gate = asyncio.Event()
+        _load_run_gate.set()
+        print(f"[LOAD] 启动 {args.load_workers} 个内置压测 worker "
+              f"→ 通过 BatchScheduler 聚合填满 bsz={batch_size}")
+        print(f"[LOAD] 控制接口: POST /load/pause  POST /load/resume  GET /load/status")
+        for _w in range(args.load_workers):
+            _load_tasks.append(asyncio.create_task(
+                _builtin_load_worker(_w, _schedulers, _load_stop)))
+
     yield
+
+    # 关闭
+    if _load_tasks:
+        _load_stop.set()
+        await asyncio.gather(*_load_tasks, return_exceptions=True)
+    for sched in _schedulers:
+        await sched.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -483,6 +840,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 @app.get("/")
 async def root():
     return HTMLResponse(content=EBT_CHAT_HTML, media_type="text/html; charset=utf-8")
+
+@app.get("/logo.png")
+async def logo_horizontal():
+    return FileResponse("/mnt/petrelfs/lixueyan/nar/sudoku_screenshot/上海人工智能实验室logo-横版.png", media_type="image/png")
+
+@app.get("/logo-vertical.png")
+async def logo_vertical():
+    return FileResponse("/mnt/petrelfs/lixueyan/nar/sudoku_screenshot/上海人工智能实验室logo-竖版.png", media_type="image/png")
 
 
 # ── POST /chat/completions ── 流式对话 ──
@@ -506,23 +871,24 @@ async def chat_completions(request: ChatRequest):
     top_p = max(0.0, min(1.0, top_p))
     max_tok = max(1, min(4096, max_tok))
 
-    engine: EBTChatEngine = app.state.engine
     messages_dicts = [{"role": m.role, "content": m.content} for m in request.messages]
 
-    response_tokens = []
+    # Round-robin 选 BatchScheduler（各 GPU 轮流承接用户请求）
+    global _sched_idx
+    sched = _schedulers[_sched_idx % len(_schedulers)]
+    _sched_idx += 1
+
+    response_tokens: List[str] = []
 
     async def stream_sse():
-        async with generate_lock:
-            # 直接在主线程执行生成，避免 CUDA/cublas 句柄在线程池里初始化失败。
-            gen = engine.generate_stream_multi_turn(messages_dicts, max_tokens=max_tok,
-                                                     temperature=temp, top_p=top_p)
-            try:
-                for tok in gen:
-                    response_tokens.append(tok)
-                    yield f"data: {json.dumps({'token': tok}, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(0)
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        logger.info(f"[USER→SCHED] device={sched.device} q={sched._queue.qsize()}")
+        try:
+            async for tok in sched.generate(messages_dicts, max_tokens=max_tok,
+                                             temperature=temp, top_p=top_p):
+                response_tokens.append(tok)
+                yield f"data: {json.dumps({'token': tok}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         full_response = "".join(response_tokens)
         logger.info(f"[ASSISTANT]: {full_response}")
@@ -661,6 +1027,37 @@ async def status():
     return info
 
 
+# ── 压测开关接口 ──
+@app.api_route("/load/pause", methods=["GET", "POST"])
+async def load_pause():
+    if _load_run_gate is None:
+        return {"load": "not_configured"}
+    _load_run_gate.clear()
+    logger.info("[LOAD] 压测已暂停")
+    return {"load": "paused"}
+
+
+@app.api_route("/load/resume", methods=["GET", "POST"])
+async def load_resume():
+    if _load_run_gate is None:
+        return {"load": "not_configured"}
+    _load_run_gate.set()
+    logger.info("[LOAD] 压测已恢复")
+    return {"load": "running"}
+
+
+@app.api_route("/load/status", methods=["GET", "POST"])
+async def load_status():
+    if _load_run_gate is None:
+        return {"load": "not_configured"}
+    return {
+        "load": "running" if _load_run_gate.is_set() else "paused",
+        "schedulers": len(_schedulers),
+        "batch_size": args.batch_size,
+        "pending_per_sched": [s._queue.qsize() for s in _schedulers],
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 内嵌 HTML UI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -677,101 +1074,229 @@ EBT_CHAT_HTML = r"""<!DOCTYPE html>
         html, body { height: 100%; margin: 0; }
         body {
             font-family: ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
-            background-color: #ffffff; color: #111827;
+            background: #fff; color: #111827;
             min-height: 100dvh; display: flex; flex-direction: column;
         }
+
+        /* ── Header ── */
         .header {
-            background-color: #ffffff; padding: 1rem 1.5rem;
+            background: #fff; padding: 0.7rem 1.5rem;
             display: flex; align-items: center; justify-content: space-between;
-            border-bottom: 1px solid #f3f4f6;
+            border-bottom: 1px solid #eef1f6;
+            position: sticky; top: 0; z-index: 10;
         }
         .header-left { display: flex; align-items: center; gap: 0.75rem; }
-        .header h1 { font-size: 1.25rem; font-weight: 600; margin: 0; color: #111827; }
+        .header h1 { font-size: 1.05rem; font-weight: 600; margin: 0; color: #111827; }
         .header-tag {
-            font-size: 0.7rem; background: #eef2ff; color: #4f46e5;
-            padding: 0.15rem 0.5rem; border-radius: 0.25rem; font-weight: 500;
+            font-size: 0.67rem; background: #f0f1ff; color: #5b57d1;
+            padding: 0.15rem 0.5rem; border-radius: 0.25rem; font-weight: 500; letter-spacing: 0.01em;
         }
-        .new-btn {
-            width: 32px; height: 32px; padding: 0; border: 1px solid #e5e7eb;
-            border-radius: 0.5rem; background: #fff; color: #6b7280; cursor: pointer;
-            display: flex; align-items: center; justify-content: center; transition: all 0.2s;
+        .header-right { display: flex; align-items: center; gap: 0.75rem; }
+        .icon-btn {
+            width: 30px; height: 30px; padding: 0; border: 1px solid #ebebeb;
+            border-radius: 0.45rem; background: #fff; color: #6b7280; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: all 0.15s;
         }
-        .new-btn:hover { background: #f3f4f6; border-color: #d1d5db; color: #374151; }
+        .icon-btn:hover { background: #f7f8fa; border-color: #d1d5db; color: #374151; }
+        .header-logo { height: 30px; object-fit: contain; opacity: 0.9; }
 
-        .chat-container { flex: 1; overflow-y: auto; background: #ffffff; }
+        /* ── Chat area ── */
+        .chat-container { flex: 1; overflow-y: auto; background: #fff; }
         .chat-wrapper {
-            max-width: 48rem; margin: 0 auto; padding: 2rem 1.5rem 3rem;
-            display: flex; flex-direction: column; gap: 0.75rem;
+            max-width: 780px; margin: 0 auto; padding: 2rem 1.5rem 2rem;
+            display: flex; flex-direction: column; gap: 1.5rem;
         }
-        .message { display: flex; margin-bottom: 0.5rem; color: #0d0d0d; }
-        .message.assistant { justify-content: flex-start; }
+
+        /* ── Empty state ── */
+        .empty-state {
+            display: flex; flex-direction: column; align-items: center;
+            padding: 3rem 1rem 2rem; text-align: center;
+        }
+        .empty-avatar {
+            width: 72px; height: 72px; border-radius: 50%; overflow: hidden;
+            border: 2px solid #e5e7eb; margin-bottom: 1.25rem;
+            background: #fff;
+        }
+        .empty-avatar img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 15%; }
+        .empty-state h2 { font-size: 1.4rem; font-weight: 600; margin: 0 0 0.4rem; }
+        .empty-state p { color: #6b7280; font-size: 0.9rem; margin: 0 0 2rem; max-width: 420px; line-height: 1.6; }
+        .example-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; width: 100%; max-width: 560px; }
+        .example-card {
+            background: #fafafa; border: 1px solid #ebebeb; border-radius: 0.75rem;
+            padding: 0.85rem 1rem; cursor: pointer; text-align: left;
+            transition: border-color 0.15s, box-shadow 0.15s, background 0.15s; font-size: 0.85rem;
+        }
+        .example-card:hover { background: #fff; border-color: #b8b6ff; box-shadow: 0 2px 10px rgba(79,70,229,0.07); }
+        .example-card .card-icon { font-size: 1.1rem; margin-bottom: 0.3rem; }
+        .example-card .card-text { color: #374151; line-height: 1.4; }
+
+        /* ── Messages ── */
+        .message { display: flex; gap: 0.75rem; }
         .message.user { justify-content: flex-end; }
-        .message-content { white-space: pre-wrap; line-height: 1.6; max-width: 100%; }
+        .message.assistant { justify-content: flex-start; align-items: flex-start; }
+        .message.console { justify-content: flex-start; }
+
+        .msg-avatar {
+            width: 32px; height: 32px; border-radius: 50%; overflow: hidden;
+            flex-shrink: 0; border: 1px solid #e5e7eb; background: #fff; margin-top: 2px;
+        }
+        .msg-avatar img { width: 100%; height: 100%; object-fit: cover; object-position: 50% 15%; }
+
+        .msg-body { display: flex; flex-direction: column; gap: 0.3rem; max-width: 82%; }
+        .message.user .msg-body { align-items: flex-end; max-width: 72%; }
+
+        .message-content {
+            white-space: pre-wrap; line-height: 1.75; font-size: 0.95rem;
+        }
         .message.assistant .message-content {
-            background: transparent; border: none; cursor: pointer; border-radius: 0.5rem;
-            padding: 0.5rem; margin-left: -0.5rem; transition: background-color 0.2s;
+            color: #111827; padding: 0; background: transparent;
         }
-        .message.assistant .message-content:hover { background: #f9fafb; }
         .message.user .message-content {
-            background-color: #f3f4f6; border-radius: 1.25rem; padding: 0.8rem 1rem;
-            max-width: 65%; cursor: pointer; transition: background-color 0.2s;
+            background: #f4f4f6; border: 1px solid #ebebeb;
+            border-radius: 1.1rem 1.1rem 0.25rem 1.1rem;
+            padding: 0.7rem 1rem; color: #111827; cursor: pointer;
+            transition: background 0.15s;
         }
-        .message.user .message-content:hover { background-color: #e5e7eb; }
+        .message.user .message-content:hover { background: #edeef2; }
         .message.console .message-content {
             font-family: 'Monaco','Menlo','Consolas','Courier New', monospace;
-            font-size: 0.85rem; background: #f8fafc; border: 1px solid #e2e8f0;
-            padding: 0.75rem 1rem; color: #374151; max-width: 85%; border-radius: 0.5rem;
+            font-size: 0.82rem; background: #f8fafc; border: 1px solid #e2e8f0;
+            padding: 0.75rem 1rem; color: #374151; border-radius: 0.5rem;
         }
 
-        .input-container { background: #fff; padding: 1rem; padding-bottom: calc(1rem + env(safe-area-inset-bottom)); }
-        .input-wrapper { max-width: 48rem; margin: 0 auto; display: flex; gap: 0.75rem; align-items: flex-end; }
-        .chat-input {
-            flex: 1; padding: 0.8rem 1rem; border: 1px solid #d1d5db; border-radius: 0.75rem;
-            background: #fff; color: #111827; font-size: 1rem; line-height: 1.5;
-            resize: none; outline: none; min-height: 54px; max-height: 200px;
-            transition: border-color 0.2s, box-shadow 0.2s;
+        /* ── Message actions (copy / regenerate) ── */
+        .msg-actions {
+            display: flex; gap: 0.25rem; opacity: 0; transition: opacity 0.15s;
         }
-        .chat-input::placeholder { color: #9ca3af; }
-        .chat-input:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,0.1); }
-        .send-btn {
-            flex-shrink: 0; width: 54px; height: 54px; border: 1px solid #111827;
-            border-radius: 0.75rem; background: #111827; color: #fff;
-            display: flex; align-items: center; justify-content: center;
-            cursor: pointer; transition: background 0.2s, border-color 0.2s;
+        .msg-body:hover .msg-actions { opacity: 1; }
+        .action-btn {
+            padding: 0.2rem 0.4rem; border: none; background: transparent;
+            color: #9ca3af; cursor: pointer; border-radius: 0.3rem;
+            font-size: 0.75rem; display: flex; align-items: center; gap: 0.2rem;
+            transition: color 0.15s, background 0.15s;
         }
-        .send-btn:hover:not(:disabled) { background: #4f46e5; border-color: #4f46e5; }
-        .send-btn:disabled { cursor: not-allowed; border-color: #d1d5db; background: #e5e7eb; color: #9ca3af; }
+        .action-btn:hover { color: #374151; background: #f3f4f6; }
+        .action-btn svg { width: 13px; height: 13px; }
 
-        .typing-indicator { display: inline-block; color: #6b7280; letter-spacing: 0.15em; }
-        .typing-indicator::after { content: '···'; animation: typing 1.4s infinite; }
-        @keyframes typing { 0%,60%,100%{opacity:.2;} 30%{opacity:1;} }
+        .typing-indicator { color: #9ca3af; font-size: 1.2rem; letter-spacing: 0.1em; }
+        .typing-indicator::after { content: '···'; animation: typing 1.2s infinite; }
+        @keyframes typing { 0%,60%,100%{opacity:.2} 30%{opacity:1} }
+
         .error-message {
             background: #fee2e2; border: 1px solid #fecaca; color: #b91c1c;
-            padding: 0.75rem 1rem; border-radius: 0.75rem; margin-top: 0.5rem;
+            padding: 0.65rem 0.9rem; border-radius: 0.6rem; font-size: 0.88rem;
         }
+
+        /* ── Input area ── */
+        .input-container {
+            background: #fff;
+            padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom));
+            border-top: 1px solid #eef1f6;
+        }
+        .input-wrapper { max-width: 780px; margin: 0 auto; }
+        .input-box {
+            display: flex; align-items: flex-end; gap: 0;
+            background: #fff; border: 1px solid #d7ddff; border-radius: 1rem;
+            box-shadow: 0 8px 30px rgba(31, 41, 55, 0.08);
+            transition: border-color 0.2s, box-shadow 0.2s;
+            padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+        }
+        .input-box:focus-within {
+            border-color: #8d8cff; box-shadow: 0 8px 30px rgba(31, 41, 55, 0.10), 0 0 0 2px rgba(141,140,255,0.18);
+        }
+        .input-tools { display: flex; align-items: center; gap: 0.1rem; flex-shrink: 0; margin-right: 0.35rem; }
+        .tool-btn {
+            width: 28px; height: 28px; border: none; background: transparent;
+            color: #9ca3af; cursor: pointer; border-radius: 0.4rem;
+            display: flex; align-items: center; justify-content: center;
+            transition: color 0.15s, background 0.15s; font-size: 0.8rem;
+        }
+        .tool-btn:hover { color: #374151; background: #f3f4f6; }
+        .chat-input {
+            flex: 1; border: none; outline: none; background: transparent;
+            color: #111827; font-size: 0.95rem; line-height: 1.6;
+            resize: none; min-height: 36px; max-height: 180px;
+            font-family: inherit; padding: 0.2rem 0;
+        }
+        .chat-input::placeholder { color: #9ca3af; }
+        .send-btn {
+            flex-shrink: 0; width: 34px; height: 34px; border: none;
+            border-radius: 0.6rem; background: #111827; color: #fff;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; transition: background 0.15s; margin-left: 0.35rem;
+        }
+        .send-btn:hover:not(:disabled) { background: #4f46e5; }
+        .send-btn:disabled { background: #e5e7eb; color: #9ca3af; cursor: not-allowed; }
+        .send-btn.stop-mode { background: #ef4444; }
+        .send-btn.stop-mode:hover { background: #dc2626; }
+        .input-hint { font-size: 0.72rem; color: #9ca3af; margin-top: 0.4rem; text-align: center; }
     </style>
 </head>
 <body>
     <div class="header">
         <div class="header-left">
-            <button class="new-btn" onclick="newConversation()" title="New Conversation (Ctrl+Shift+N)">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+            <button class="icon-btn" onclick="newConversation()" title="新会话 (Ctrl+Shift+N)">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
             </button>
             <h1>EBT Chat</h1>
             <span class="header-tag">Energy-Based Transformer</span>
         </div>
+        <div class="header-right">
+            <img src="/logo.png" alt="上海人工智能实验室" class="header-logo">
+        </div>
     </div>
 
     <div class="chat-container" id="chatContainer">
-        <div class="chat-wrapper" id="chatWrapper"></div>
+        <div class="chat-wrapper" id="chatWrapper">
+            <div class="empty-state" id="emptyState">
+                <div class="empty-avatar">
+                    <img src="/logo-vertical.png" alt="EBT">
+                </div>
+                <h2>EBT Chat</h2>
+                <p>Energy-Based Transformer — iterative MCMC refinement for higher-quality generation.<br>Ask anything in English.</p>
+                <div class="example-cards">
+                    <div class="example-card" onclick="fillExample(this)">
+                        <div class="card-icon">🔍</div>
+                        <div class="card-text">What is an Energy-Based Model and how does it differ from a standard Transformer?</div>
+                    </div>
+                    <div class="example-card" onclick="fillExample(this)">
+                        <div class="card-icon">🧮</div>
+                        <div class="card-text">Explain the role of Langevin dynamics in MCMC sampling</div>
+                    </div>
+                    <div class="example-card" onclick="fillExample(this)">
+                        <div class="card-icon">💡</div>
+                        <div class="card-text">Write Python code to find the minimum of f(x) = x² + 3x + 2 using gradient descent</div>
+                    </div>
+                    <div class="example-card" onclick="fillExample(this)">
+                        <div class="card-icon">📝</div>
+                        <div class="card-text">Briefly explain contrastive divergence training for EBMs</div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div class="input-container">
         <div class="input-wrapper">
-            <textarea id="chatInput" class="chat-input" placeholder="输入消息或 /help 查看命令..." rows="1" onkeydown="handleKeyDown(event)"></textarea>
-            <button id="sendButton" class="send-btn" onclick="sendMessage()" disabled>
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
-            </button>
+            <div class="input-box">
+                <div class="input-tools">
+                    <button class="tool-btn" onclick="fillInput('/help')" title="/help — 查看命令">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>
+                    </button>
+                    <button class="tool-btn" onclick="newConversation()" title="清空会话">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.98"/></svg>
+                    </button>
+                </div>
+                <textarea id="chatInput" class="chat-input"
+                    placeholder="Ask EBT anything, type / for commands..."
+                    rows="1" onkeydown="handleKeyDown(event)"></textarea>
+                <button id="sendButton" class="send-btn" onclick="handleSendOrStop()" disabled>
+                    <svg id="sendIcon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                    <svg id="stopIcon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+                </button>
+            </div>
+            <div class="input-hint">Shift+Enter 换行 · Ctrl+Shift+N 新会话 · /help 查看命令</div>
         </div>
     </div>
 
@@ -781,13 +1306,17 @@ const chatContainer = document.getElementById('chatContainer');
 const chatWrapper   = document.getElementById('chatWrapper');
 const chatInput     = document.getElementById('chatInput');
 const sendButton    = document.getElementById('sendButton');
+const sendIcon      = document.getElementById('sendIcon');
+const stopIcon      = document.getElementById('stopIcon');
+const emptyState    = document.getElementById('emptyState');
 
 let messages = [];
 let isGenerating = false;
+let abortController = null;
 
 chatInput.addEventListener('input', function() {
     this.style.height = 'auto';
-    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+    this.style.height = Math.min(this.scrollHeight, 180) + 'px';
     sendButton.disabled = !this.value.trim() || isGenerating;
 });
 
@@ -799,41 +1328,129 @@ document.addEventListener('keydown', function(e) {
     if (e.ctrlKey && e.shiftKey && e.key === 'N') { e.preventDefault(); if (!isGenerating) newConversation(); }
 });
 
+function fillExample(card) {
+    chatInput.value = card.querySelector('.card-text').textContent.trim();
+    chatInput.style.height = 'auto';
+    chatInput.style.height = Math.min(chatInput.scrollHeight, 180) + 'px';
+    sendButton.disabled = false;
+    chatInput.focus();
+}
+
+function fillInput(text) {
+    chatInput.value = text;
+    chatInput.style.height = 'auto';
+    sendButton.disabled = false;
+    chatInput.focus();
+}
+
+function setGenerating(v) {
+    isGenerating = v;
+    sendButton.disabled = false;
+    if (v) {
+        sendButton.classList.add('stop-mode');
+        sendIcon.style.display = 'none';
+        stopIcon.style.display = '';
+    } else {
+        sendButton.classList.remove('stop-mode');
+        sendIcon.style.display = '';
+        stopIcon.style.display = 'none';
+        sendButton.disabled = !chatInput.value.trim();
+    }
+}
+
+function handleSendOrStop() {
+    if (isGenerating) {
+        if (abortController) abortController.abort();
+    } else {
+        sendMessage();
+    }
+}
+
 function newConversation() {
-    messages = []; chatWrapper.innerHTML = '';
+    if (abortController) abortController.abort();
+    messages = [];
+    chatWrapper.innerHTML = '';
+    chatWrapper.appendChild(emptyState);
+    emptyState.style.display = '';
     chatInput.value = ''; chatInput.style.height = 'auto';
-    sendButton.disabled = false; isGenerating = false; chatInput.focus();
+    setGenerating(false); chatInput.focus();
+}
+
+function hideEmptyState() {
+    emptyState.style.display = 'none';
 }
 
 function addMessage(role, content, messageIndex) {
-    const div = document.createElement('div');
-    div.className = 'message ' + role;
+    hideEmptyState();
+    const wrap = document.createElement('div');
+    wrap.className = 'message ' + role;
+
+    if (role === 'assistant') {
+        const av = document.createElement('div');
+        av.className = 'msg-avatar';
+        av.innerHTML = '<img src="/logo-vertical.png" alt="EBT">';
+        wrap.appendChild(av);
+    }
+
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+
     const c = document.createElement('div');
     c.className = 'message-content';
     c.textContent = content;
+
     if (role === 'user' && messageIndex !== undefined) {
         c.title = '点击编辑并从此处重新开始';
         c.addEventListener('click', () => { if (!isGenerating) editMessage(messageIndex); });
     }
+    body.appendChild(c);
+
     if (role === 'assistant' && messageIndex !== undefined) {
-        c.title = '点击重新生成此回复';
-        c.addEventListener('click', () => { if (!isGenerating) regenerateMessage(messageIndex); });
+        const actions = document.createElement('div');
+        actions.className = 'msg-actions';
+        actions.innerHTML = `
+          <button class="action-btn" title="复制" onclick="copyMsg(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            复制
+          </button>
+          <button class="action-btn" title="重新生成" onclick="regenFromAction(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.98"/></svg>
+            重新生成
+          </button>`;
+        body.appendChild(actions);
     }
-    div.appendChild(c);
-    chatWrapper.appendChild(div);
+
+    wrap.appendChild(body);
+    chatWrapper.appendChild(wrap);
     chatContainer.scrollTop = chatContainer.scrollHeight;
     return c;
+}
+
+function copyMsg(btn) {
+    const text = btn.closest('.msg-body').querySelector('.message-content').textContent;
+    navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '已复制'; setTimeout(() => { btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> 复制`; }, 1500);
+    });
+}
+
+function regenFromAction(btn) {
+    if (isGenerating) return;
+    const msgEl = btn.closest('.message');
+    const allMsgs = [...chatWrapper.querySelectorAll('.message')];
+    const idx = allMsgs.indexOf(msgEl);
+    if (idx >= 0) regenerateMessage(idx);
 }
 
 function editMessage(idx) {
     if (idx < 0 || idx >= messages.length || messages[idx].role !== 'user') return;
     chatInput.value = messages[idx].content;
     chatInput.style.height = 'auto';
-    chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
+    chatInput.style.height = Math.min(chatInput.scrollHeight, 180) + 'px';
     messages = messages.slice(0, idx);
     const all = chatWrapper.querySelectorAll('.message');
     for (let i = idx; i < all.length; i++) all[i].remove();
-    sendButton.disabled = false; chatInput.focus();
+    if (messages.length === 0) { chatWrapper.appendChild(emptyState); emptyState.style.display = ''; }
+    setGenerating(false); chatInput.focus();
 }
 
 async function regenerateMessage(idx) {
@@ -845,14 +1462,16 @@ async function regenerateMessage(idx) {
 }
 
 async function generateAssistantResponse() {
-    isGenerating = true; sendButton.disabled = true;
+    setGenerating(true);
+    abortController = new AbortController();
     const el = addMessage('assistant', '');
     el.innerHTML = '<span class="typing-indicator"></span>';
     try {
         const resp = await fetch(API_URL + '/chat/completions', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ messages: messages })
+            body: JSON.stringify({ messages: messages }),
+            signal: abortController.signal,
         });
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
         const reader = resp.body.getReader();
@@ -873,38 +1492,49 @@ async function generateAssistantResponse() {
                 try {
                     const d = JSON.parse(line.slice(6));
                     if (d.token) { full += d.token; el.textContent = full; chatContainer.scrollTop = chatContainer.scrollHeight; }
-                    if (d.error) {
-                        el.innerHTML = '<div class="error-message">Error: ' + d.error + '</div>';
-                        serverDone = true;
-                        break;
-                    }
-                    if (d.done) {
-                        serverDone = true;
-                        break;
-                    }
+                    if (d.error) { el.innerHTML = '<div class="error-message">Error: ' + d.error + '</div>'; serverDone = true; break; }
+                    if (d.done) { serverDone = true; break; }
                 } catch(_){}
             }
             if (serverDone || done) break;
         }
-        if (serverDone) {
-            try { await reader.cancel(); } catch(_) {}
-        }
+        if (serverDone) { try { await reader.cancel(); } catch(_) {} }
         const tail = sseBuf.trim();
         if (!serverDone && tail.startsWith('data: ')) {
             try {
                 const d = JSON.parse(tail.slice(6));
-                if (d.token) { full += d.token; el.textContent = full; chatContainer.scrollTop = chatContainer.scrollHeight; }
+                if (d.token) { full += d.token; el.textContent = full; }
                 if (d.error) { el.innerHTML = '<div class="error-message">Error: ' + d.error + '</div>'; }
             } catch(_){}
         }
         const aidx = messages.length;
         messages.push({role:'assistant', content: full});
-        el.title = '点击重新生成此回复';
-        el.addEventListener('click', () => { if (!isGenerating) regenerateMessage(aidx); });
+        // add action buttons after done
+        const body = el.closest('.msg-body');
+        if (body) {
+            const actions = document.createElement('div');
+            actions.className = 'msg-actions';
+            actions.innerHTML = `
+              <button class="action-btn" title="复制" onclick="copyMsg(this)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                复制
+              </button>
+              <button class="action-btn" title="重新生成" onclick="regenFromAction(this)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.98"/></svg>
+                重新生成
+              </button>`;
+            body.appendChild(actions);
+        }
     } catch(err) {
-        el.innerHTML = '<div class="error-message">Error: ' + err.message + '</div>';
+        if (err.name === 'AbortError') {
+            if (!el.textContent) el.innerHTML = '<span style="color:#9ca3af;font-size:0.85rem">已停止生成</span>';
+            messages.push({role:'assistant', content: el.textContent});
+        } else {
+            el.innerHTML = '<div class="error-message">Error: ' + err.message + '</div>';
+        }
     } finally {
-        isGenerating = false; sendButton.disabled = !chatInput.value.trim();
+        setGenerating(false);
+        abortController = null;
     }
 }
 
@@ -934,13 +1564,18 @@ async function sendMessage() {
     await generateAssistantResponse();
 }
 
-sendButton.disabled = false;
+setGenerating(false);
 chatInput.focus();
 
 fetch(API_URL + '/health').then(r=>r.json()).then(d=>{
     console.log('EBT Engine status:', d);
-}).catch(err=>{
-    chatWrapper.innerHTML = '<div class="error-message">EBT 引擎未就绪，请等待模型加载完成后刷新页面。</div>';
+}).catch(() => {
+    hideEmptyState();
+    const err = document.createElement('div');
+    err.className = 'error-message';
+    err.style.margin = '2rem auto'; err.style.maxWidth = '600px';
+    err.textContent = 'EBT 引擎未就绪，请等待模型加载完成后刷新页面。';
+    chatWrapper.appendChild(err);
 });
 </script>
 </body>
