@@ -46,6 +46,10 @@ INFER_BLOCK_USE_REFINE="${INFER_BLOCK_USE_REFINE:-true}"
 INFER_BLOCK_REFINE_STEPS="${INFER_BLOCK_REFINE_STEPS:-0}"
 INFER_BLOCK_INIT_LOGIT_SCALE="${INFER_BLOCK_INIT_LOGIT_SCALE:-8.0}"
 INFER_BLOCK_DIAGNOSE="${INFER_BLOCK_DIAGNOSE:-false}"
+INFER_USE_KV_CACHE="${INFER_USE_KV_CACHE:-false}"
+INFER_TEMP="${INFER_TEMP:-0.6}"
+INFER_TOPP="${INFER_TOPP:-0.9}"
+INFER_MAX_GEN_LEN="${INFER_MAX_GEN_LEN:-256}"
 
 ################################################################################
 # 参数验证
@@ -165,6 +169,12 @@ if [ "$INFER_BLOCK_DIAGNOSE" = "true" ]; then
     BLOCK_DIAG_FLAG="--infer_block_diagnose"
 fi
 
+KV_CACHE_FLAG=""
+if [ "$INFER_USE_KV_CACHE" = "true" ]; then
+    KV_CACHE_FLAG="--infer_use_kv_cache"
+fi
+echo "🗃️  KV cache: $INFER_USE_KV_CACHE | temp=$INFER_TEMP topp=$INFER_TOPP max_gen=$INFER_MAX_GEN_LEN"
+
 echo ""
 echo "🚀 开始评估..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -182,14 +192,15 @@ $PYTHON train.py \
     --dataset_name "$DATASET_NAME" \
     --context_length 256 \
     --tokenizer "$TOKENIZER_PATH" \
-    --infer_max_gen_len 256 \
-    --infer_temp 0.6 \
-    --infer_topp 0.9 \
+    --infer_max_gen_len "$INFER_MAX_GEN_LEN" \
+    --infer_temp "$INFER_TEMP" \
+    --infer_topp "$INFER_TOPP" \
     --infer_block_size "$INFER_BLOCK_SIZE" \
     --infer_block_use_refine "$INFER_BLOCK_USE_REFINE" \
     --infer_block_refine_steps "$INFER_BLOCK_REFINE_STEPS" \
     --infer_block_init_logit_scale "$INFER_BLOCK_INIT_LOGIT_SCALE" \
     $BLOCK_DIAG_FLAG \
+    $KV_CACHE_FLAG \
     --gpus "$GPUS" \
     --distributed_strategy "auto" \
     --batch_size_per_device "$BATCH_SIZE" \

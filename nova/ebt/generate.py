@@ -36,18 +36,25 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
-def call_model_forward_decode(hparams, model, input_tokens, start_pos, bsz):
+def call_model_forward_decode(hparams, model, input_tokens, start_pos, bsz, kv_cache=None):
     #TODO eventually add back kv caching, for now start_pos is not supported  in baseline transformer and EBT so start_pos can only be 0
     if hparams.model_name == "ebt":
         if hparams.infer_ebt_advanced:
+            if kv_cache is not None:
+                raise NotImplementedError("KV cache is not supported with --infer_ebt_advanced.")
             ebt_outputs = model.ebt_advanced_inference(input_tokens, start_pos = 0, learning = False)
             logits = ebt_outputs[0] # dont return a list just return the final predicted logits
         else:
-            ebt_outputs = model.forward(input_tokens, start_pos = 0, learning = False, return_raw_logits = True)
+            forward_kwargs = dict(start_pos=0, learning=False, return_raw_logits=True)
+            if kv_cache is not None:
+                forward_kwargs["kv_cache"] = kv_cache
+            ebt_outputs = model.forward(input_tokens, **forward_kwargs)
             logits = ebt_outputs[0][-1] # uses 0, -1 since ebt returns tuple of lists of (logits, energy predictions) for each mcmc step; dont want learning mode since needs grad
         energies = ebt_outputs[1]
         energies = [energy_tensor.reshape(bsz, -1).mean(dim=1) for energy_tensor in energies] # will be num_mcmc_step * energy landscapes len list, with bsz elements each
     else:
+        if kv_cache is not None:
+            raise NotImplementedError("KV cache is currently only implemented for EBT models.")
         logits = model.forward(input_tokens, start_pos = 0, learning = False, return_raw_logits = True)
     return logits
 
@@ -331,36 +338,98 @@ def generate_text(model, batch, hparams):
                 ignore_index=pad_id,
             )
         if infer_block_size <= 1:
-            for cur_pos in range(min_prompt_len, total_len):
-                input_tokens = tokens[:, :cur_pos] # NOTE removed prev_pos since are not using start_pos in model forward for now, TODO eventually add back
-                logits = call_model_forward_decode(hparams, model, input_tokens, prev_pos, bsz)
-                if temperature > 0:
-                    probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                    next_token = sample_top_p(probs, top_p)
-                else:
-                    next_token = torch.argmax(logits[:, -1], dim=-1)
-                
-                next_token = next_token.reshape(-1)
-                # only replace token if prompt has already been generated
-                next_token = torch.where(
-                    input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            # KV cache (sequential decode only; dense_token / mtp_mcmc EBT only).
+            use_kv_cache = bool(
+                getattr(hparams, "infer_use_kv_cache", False)
+                and hparams.model_name == "ebt"
+                and not getattr(hparams, "infer_ebt_advanced", False)
+                and not logprobs
+                and getattr(model, "_block_mode", "dense_token") in ("dense_token", "mtp_mcmc")
+            )
+            kv_cache = None
+            if use_kv_cache:
+                from ar_ebt_time_embed import make_kv_cache
+                cache_dtype = next(model.parameters()).dtype
+                kv_cache = make_kv_cache(
+                    model.transformer, bsz=bsz, max_seqlen=total_len + 4,
+                    dtype=cache_dtype, device=tokens.device,
                 )
-                tokens[:, cur_pos] = next_token
-                if logprobs:
-                    token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                        input=logits.transpose(1, 2),
-                        target=tokens[:, prev_pos + 1 : cur_pos + 1],
-                        reduction="none",
-                        ignore_index=pad_id,
-                    )
-                # Get EOS token ID safely (use the same logic as above)
                 eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
-                eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                    next_token == eos_token_id
-                )
-                prev_pos = cur_pos
-                if all(eos_reached):
-                    break
+
+                # PREFILL: one full forward over tokens[:, :min_prompt_len].
+                # Predict tokens[:, min_prompt_len] from logits[:, -1].
+                if min_prompt_len > 0:
+                    prefill_tokens = tokens[:, :min_prompt_len]
+                    logits = call_model_forward_decode(
+                        hparams, model, prefill_tokens, prev_pos, bsz, kv_cache=kv_cache
+                    )
+                    cur_pos = min_prompt_len
+                    if cur_pos < total_len:
+                        if temperature > 0:
+                            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                            next_token = sample_top_p(probs, top_p)
+                        else:
+                            next_token = torch.argmax(logits[:, -1], dim=-1)
+                        next_token = next_token.reshape(-1)
+                        next_token = torch.where(
+                            input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+                        )
+                        tokens[:, cur_pos] = next_token
+                        eos_reached |= (~input_text_mask[:, cur_pos]) & (next_token == eos_token_id)
+                        prev_pos = cur_pos
+
+                # DECODE: feed only the just-generated token; cache holds the rest.
+                if not bool(eos_reached.all()):
+                    for cur_pos in range(min_prompt_len + 1, total_len):
+                        new_tok = tokens[:, cur_pos - 1:cur_pos]   # (B, 1)
+                        logits = call_model_forward_decode(
+                            hparams, model, new_tok, prev_pos, bsz, kv_cache=kv_cache
+                        )
+                        if temperature > 0:
+                            probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                            next_token = sample_top_p(probs, top_p)
+                        else:
+                            next_token = torch.argmax(logits[:, -1], dim=-1)
+                        next_token = next_token.reshape(-1)
+                        next_token = torch.where(
+                            input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+                        )
+                        tokens[:, cur_pos] = next_token
+                        eos_reached |= (~input_text_mask[:, cur_pos]) & (next_token == eos_token_id)
+                        prev_pos = cur_pos
+                        if all(eos_reached):
+                            break
+            else:
+                for cur_pos in range(min_prompt_len, total_len):
+                    input_tokens = tokens[:, :cur_pos] # NOTE removed prev_pos since are not using start_pos in model forward for now, TODO eventually add back
+                    logits = call_model_forward_decode(hparams, model, input_tokens, prev_pos, bsz)
+                    if temperature > 0:
+                        probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                        next_token = sample_top_p(probs, top_p)
+                    else:
+                        next_token = torch.argmax(logits[:, -1], dim=-1)
+
+                    next_token = next_token.reshape(-1)
+                    # only replace token if prompt has already been generated
+                    next_token = torch.where(
+                        input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+                    )
+                    tokens[:, cur_pos] = next_token
+                    if logprobs:
+                        token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
+                            input=logits.transpose(1, 2),
+                            target=tokens[:, prev_pos + 1 : cur_pos + 1],
+                            reduction="none",
+                            ignore_index=pad_id,
+                        )
+                    # Get EOS token ID safely (use the same logic as above)
+                    eos_token_id = getattr(tokenizer, 'eos_token_id', getattr(tokenizer, 'bos_token_id', 0))
+                    eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                        next_token == eos_token_id
+                    )
+                    prev_pos = cur_pos
+                    if all(eos_reached):
+                        break
         else:
             cur_pos = min_prompt_len
             while cur_pos < total_len:

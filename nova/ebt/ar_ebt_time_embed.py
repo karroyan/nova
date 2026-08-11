@@ -18,6 +18,126 @@ from utils import (
 )
 
 
+# ---------------------------------------------------------------------------
+# KV cache containers (dense_token / mtp_mcmc inference only).
+# Only the context portion (positions 1..S) of the EBT attention layout is
+# cached. The time-embedding (position 0) varies per MCMC step and the
+# predicted latents (positions S+1..S+K) vary per MCMC update, so neither is
+# cached. K/V are stored AFTER RoPE has been applied, since RoPE depends on
+# absolute position which is stable for context tokens across decode steps.
+# ---------------------------------------------------------------------------
+
+class KVCacheLayer:
+    """Per-layer cache of context K/V (RoPE-applied)."""
+
+    def __init__(self, max_seqlen: int, bsz: int, n_kv_heads: int, head_dim: int,
+                 dtype: torch.dtype, device: torch.device):
+        self.max_seqlen = max_seqlen
+        self.cached_k = torch.zeros(bsz, max_seqlen, n_kv_heads, head_dim,
+                                    dtype=dtype, device=device)
+        self.cached_v = torch.zeros(bsz, max_seqlen, n_kv_heads, head_dim,
+                                    dtype=dtype, device=device)
+        self.cached_len = 0
+
+    def append(self, k_new: torch.Tensor, v_new: torch.Tensor):
+        """k_new/v_new: (B, T_new, n_kv_heads, head_dim). RoPE already applied."""
+        T = k_new.shape[1]
+        if self.cached_len + T > self.max_seqlen:
+            raise RuntimeError(
+                f"KVCacheLayer overflow: cached_len={self.cached_len}, T_new={T}, max_seqlen={self.max_seqlen}"
+            )
+        # detach so the cache never participates in autograd; MCMC backward
+        # only flows through the freshly computed K/V each call.
+        self.cached_k[:, self.cached_len:self.cached_len + T] = k_new.detach()
+        self.cached_v[:, self.cached_len:self.cached_len + T] = v_new.detach()
+        self.cached_len += T
+
+    def get(self):
+        return self.cached_k[:, :self.cached_len], self.cached_v[:, :self.cached_len]
+
+
+class KVCache:
+    """Whole-model KV cache with PER-MCMC-STEP sub-caches.
+
+    Rationale: in the EBT time_embed layout the time-embedding token (which
+    encodes the MCMC step) is prepended to the sequence and is attended by the
+    context tokens. Therefore the context K/V at layers >= 1 are a function of
+    the MCMC step, and a single cache cannot be reused across MCMC steps. We
+    keep one independent sub-cache per MCMC step value (0 .. n_steps-1).
+
+    All sub-caches advance their cached_len independently but in practice stay
+    in lockstep (each is appended once per outer decode step).
+    """
+
+    def __init__(self, n_layers: int, n_steps: int, max_seqlen: int, bsz: int,
+                 n_kv_heads: int, head_dim: int,
+                 dtype: torch.dtype, device: torch.device):
+        self.n_steps = max(1, int(n_steps))
+        self.step_caches = [
+            [KVCacheLayer(max_seqlen, bsz, n_kv_heads, head_dim, dtype, device)
+             for _ in range(n_layers)]
+            for _ in range(self.n_steps)
+        ]
+
+    def layers_for_step(self, step: int):
+        return self.step_caches[int(step)]
+
+    def cached_len_for_step(self, step: int) -> int:
+        return self.step_caches[int(step)][0].cached_len
+
+    @property
+    def cached_len(self) -> int:
+        # Representative value (sub-cache 0). All sub-caches are in lockstep at
+        # outer-step boundaries, which is where this is read.
+        return self.step_caches[0][0].cached_len
+
+    def reset(self):
+        for sc in self.step_caches:
+            for layer in sc:
+                layer.cached_len = 0
+
+    def reset_step_to(self, step: int, target_len: int):
+        """Roll back one MCMC step's sub-cache to target_len in every layer.
+        Used to make the MCMC inner loop idempotent: each MCMC iteration
+        rebuilds its new-ctx K/V afresh on top of the prior outer steps'
+        cached prefix, without disturbing other steps' sub-caches."""
+        for layer in self.step_caches[int(step)]:
+            if target_len > layer.cached_len:
+                raise RuntimeError(
+                    f"reset_step_to(step={step}, {target_len}) cannot extend cached_len={layer.cached_len}"
+                )
+            layer.cached_len = target_len
+
+
+def make_kv_cache(transformer, bsz: int, max_seqlen: int,
+                  n_steps: Optional[int] = None,
+                  dtype: torch.dtype = torch.float32,
+                  device: Optional[torch.device] = None) -> KVCache:
+    """Build a KVCache sized for the given EBTTimeConcat transformer.
+
+    n_steps defaults to the transformer's number of time-embedding slots
+    (= mcmc_num_steps), giving one sub-cache per MCMC step.
+    """
+    params = transformer.params
+    n_kv_heads = params.n_heads if params.n_kv_heads is None else params.n_kv_heads
+    head_dim = params.dim // params.n_heads
+    if device is None:
+        device = next(transformer.parameters()).device
+    if n_steps is None:
+        # EBTTimeConcat stores time_embeddings = nn.Embedding(max_mcmc_steps, dim)
+        n_steps = getattr(getattr(transformer, "time_embeddings", None), "num_embeddings", 1)
+    return KVCache(
+        n_layers=params.n_layers,
+        n_steps=n_steps,
+        max_seqlen=max_seqlen,
+        bsz=bsz,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+    )
+
+
 def _resolve_block_mode(explicit: Optional[str], fallback: str) -> str:
     """Resolve a block_mode string, preferring the explicit argument.
 
@@ -430,6 +550,7 @@ class Attention(nn.Module):
         context_len: int,
         pred_len: int,
         block_mode: str,
+        kv_cache_layer: Optional["KVCacheLayer"] = None,
     ):
         """Forward pass of the attention module.
 
@@ -443,6 +564,16 @@ class Attention(nn.Module):
             ``_forward_explicit_block_latent`` (a separate, plain SDPA
             implementation that uses the additive ``mask`` to encode
             visibility for ``S * K`` independent future latents).
+
+        KV cache (dense_token / mtp_mcmc only):
+          When ``kv_cache_layer`` is provided, the layer caches the context
+          K/V (positions 1..S, RoPE applied). Two cache modes:
+            * prefill (cached_len == 0 entering, n_new_ctx >= 1): runs the
+              full legacy attention and writes context K/V to cache at the
+              end. Output shape and math are identical to the no-cache path.
+            * decode (cached_len > 0, n_new_ctx == 1, pred_len == 1): uses
+              a specialized short-input path. ``x`` must be
+              ``[time, c_new, z_new]`` of length 3.
 
         Args:
             x: Input tensor of shape ``(B, 1 + context_len + pred_len, D)``.
@@ -470,6 +601,10 @@ class Attention(nn.Module):
             # Plain full-sequence SDPA path with an explicit (S, K) mask.
             # Lives in its own method so that mtp_mcmc / dense_token logic
             # below is *byte-identical* to the previous version.
+            if kv_cache_layer is not None:
+                raise NotImplementedError(
+                    "KV cache is currently only supported for dense_token / mtp_mcmc."
+                )
             return self._forward_explicit_block_latent(
                 x=x,
                 freqs_cis=freqs_cis,
@@ -477,6 +612,15 @@ class Attention(nn.Module):
             )
         if block_mode not in ("dense_token", "mtp_mcmc"):
             raise ValueError(f"Unsupported block_mode={block_mode!r}")
+
+        # Cache-aware DECODE: cache already has context, input carries only
+        # [time, 1 new ctx, 1 pred]. Specialized short path.
+        if kv_cache_layer is not None and kv_cache_layer.cached_len > 0:
+            return self._forward_dense_decode(
+                x=x,
+                freqs_cis=freqs_cis,
+                kv_cache_layer=kv_cache_layer,
+            )
 
         # dense_token and mtp_mcmc share the legacy symmetric attention math.
         # pred_len == context_len is a shape invariant under these modes; it
@@ -564,6 +708,120 @@ class Attention(nn.Module):
         output_p = output_p.transpose(1, 2).contiguous().view(bsz, pred_len, -1)
         output = torch.cat((output_o, output_p), dim=1)  # B, (S+1)+K, D
 
+        # Cache write (prefill): store context K/V (positions 1..context_len,
+        # RoPE applied). Skip the time embedding (index 0) which is per-MCMC.
+        if kv_cache_layer is not None:
+            n_to_write = context_len - kv_cache_layer.cached_len
+            if n_to_write > 0:
+                ctx_xk = xk_o[:, 1 + kv_cache_layer.cached_len:1 + context_len]
+                ctx_xv = xv_o[:, 1 + kv_cache_layer.cached_len:1 + context_len]
+                kv_cache_layer.append(ctx_xk, ctx_xv)
+
+        return self.wo(output)
+
+    def _forward_dense_decode(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        kv_cache_layer: "KVCacheLayer",
+    ):
+        """Specialized dense_token / mtp_mcmc decode-mode attention.
+
+        Layout: ``x = [time, c_new, z_new]`` of length 3. Cached context
+        ``c_1..c_{cached_len}`` lives in ``kv_cache_layer``. After this call
+        ``cached_len`` grows by 1.
+
+        ``freqs_cis`` indexes positions for the new tokens in the layout
+        ``[time(pos 0), c_new(pos cached_len+1), z_new(pos cached_len+2)]``
+        and has length 3 (caller builds it via ``index_select``).
+        """
+        bsz, T_new, _ = x.shape
+        if T_new != 3:
+            raise NotImplementedError(
+                f"_forward_dense_decode currently supports only T_new=3 "
+                f"(time + 1 new ctx + 1 pred); got T_new={T_new}."
+            )
+
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(bsz, T_new, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, T_new, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, T_new, self.n_local_kv_heads, self.head_dim)
+
+        # Split: new_o = [time, c_new] (positions 0 and cached_len+1);
+        #        new_p = [z_new] (position cached_len+2).
+        new_o_xq = xq[:, :2]
+        new_o_xk = xk[:, :2]
+        new_o_xv = xv[:, :2]
+        new_p_xq = xq[:, 2:]
+        new_p_xk = xk[:, 2:]
+        new_p_xv = xv[:, 2:]
+
+        new_o_xq, new_o_xk = apply_rotary_emb(new_o_xq, new_o_xk, freqs_cis=freqs_cis[:2])
+        new_p_xq, new_p_xk = apply_rotary_emb(new_p_xq, new_p_xk, freqs_cis=freqs_cis[2:3])
+
+        # Append the new context (c_new at index 1 within new_o) to cache.
+        new_ctx_xk = new_o_xk[:, 1:2]
+        new_ctx_xv = new_o_xv[:, 1:2]
+        kv_cache_layer.append(new_ctx_xk, new_ctx_xv)
+        S_total = kv_cache_layer.cached_len  # = cached_len_pre + 1
+        cached_ctx_k, cached_ctx_v = kv_cache_layer.get()  # (B, S_total, H_kv, D)
+
+        # Build full keys_o = [time_K_new, cached_ctx_K (RoPE already applied)]
+        # of length 1 + S_total. time uses the fresh K from this call.
+        time_xk = new_o_xk[:, 0:1]
+        time_xv = new_o_xv[:, 0:1]
+        keys_o = torch.cat([time_xk, cached_ctx_k], dim=1)   # (B, 1 + S_total, H_kv, D)
+        values_o = torch.cat([time_xv, cached_ctx_v], dim=1)
+
+        # --- Context (o) path output for the new positions only. ---
+        # query time (idx 0) can only attend the time key (causal). query
+        # c_new (idx 1) can attend the full context+time (it's the latest).
+        new_o_xq_t = new_o_xq.transpose(1, 2)            # (B, H, 2, D)
+        keys_o_t = keys_o.transpose(1, 2)                # (B, H_kv, 1+S, D)
+        values_o_t = values_o.transpose(1, 2)            # (B, H_kv, 1+S, D)
+        scores_o = torch.matmul(new_o_xq_t, keys_o_t.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # additive causal mask of shape (2, 1+S_total): row 0 (time) sees only key 0; row 1 (c_new) sees all.
+        causal_o = torch.full(
+            (2, 1 + S_total), float("-inf"), device=x.device, dtype=scores_o.dtype
+        )
+        causal_o[0, 0] = 0.0
+        causal_o[1, :] = 0.0
+        scores_o = scores_o + causal_o
+        scores_o = F.softmax(scores_o.float(), dim=-1).type_as(new_o_xq_t)
+        output_o = torch.matmul(scores_o, values_o_t)
+        output_o = output_o.transpose(1, 2).contiguous().view(bsz, 2, -1)
+
+        # --- Pred (p) path: z_new attends [time, c_1..c_{S_total}] + self. ---
+        new_p_xq_t = new_p_xq.transpose(1, 2)            # (B, H, 1, D)
+        scores_p = torch.matmul(new_p_xq_t, keys_o_t.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # Append a single placeholder column for the z_new self-attention.
+        temp_append = torch.zeros(
+            (scores_p.shape[0], scores_p.shape[1], scores_p.shape[2], 1),
+            dtype=scores_p.dtype, device=scores_p.device,
+        )
+        scores_p = torch.cat((scores_p, temp_append), dim=-1)  # (B, H, 1, 1+S_total+1)
+
+        # Self-attention insertion: z_new attends itself via (q · k) at the
+        # last column (the placeholder we just appended). No causal mask
+        # needed: K_new=1 means there is no "future pred" to hide.
+        insertion_self = (new_p_xq * new_p_xk).sum(dim=3) / math.sqrt(self.head_dim)
+        insertion_self = insertion_self.to(scores_p.dtype)  # (B, 1, H)
+        # place at scores_p[:, :, 0, -1]
+        insertion_full = torch.zeros_like(scores_p)
+        # insertion_self shape: (B, K_new=1, H); we need (B, H, 1, 1)
+        insertion_full[:, :, 0, -1] = insertion_self.transpose(1, 2).squeeze(-1)
+        scores_p = scores_p + insertion_full
+
+        scores_p = F.softmax(scores_p.float(), dim=-1).type_as(new_p_xq_t)
+        # Pull the self weight out, then mix values_o for context part and values_p for self.
+        self_weight = scores_p[:, :, :, -1:]  # (B, H, 1, 1)
+        scores_p_ctx = scores_p[:, :, :, :-1]  # (B, H, 1, 1+S_total)
+        output_p_ctx = torch.matmul(scores_p_ctx, values_o_t)  # (B, H, 1, D)
+        new_p_xv_t = new_p_xv.transpose(1, 2)                  # (B, H_kv, 1, D)
+        output_p = output_p_ctx + self_weight * new_p_xv_t
+        output_p = output_p.transpose(1, 2).contiguous().view(bsz, 1, -1)
+
+        output = torch.cat((output_o, output_p), dim=1)        # (B, 3, D)
         return self.wo(output)
 
     def _forward_explicit_block_latent(
@@ -743,6 +1001,7 @@ class TransformerBlock(nn.Module):
         context_len: int,
         pred_len: int,
         block_mode: str,
+        kv_cache_layer: Optional["KVCacheLayer"] = None,
     ):
         """Perform a forward pass through the TransformerBlock.
 
@@ -756,6 +1015,7 @@ class TransformerBlock(nn.Module):
             context_len=context_len,
             pred_len=pred_len,
             block_mode=block_mode,
+            kv_cache_layer=kv_cache_layer,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -819,6 +1079,7 @@ class EBTTimeConcat(nn.Module):
         return_context_hidden: bool = False,
         block_mode: Optional[str] = None,
         block_size: Optional[int] = None,
+        kv_cache: Optional["KVCache"] = None,
     ):
         """Perform a forward pass through the Transformer model.
 
@@ -861,50 +1122,103 @@ class EBTTimeConcat(nn.Module):
             raise ValueError(
                 f"context_len + pred_len must equal embeddings length, got {context_len}+{pred_len}!={embeddings.shape[1]}"
             )
-        # Shape invariant for dense_token / mtp_mcmc.
-        if pred_len != context_len:
+
+        # Decide cache path. In decode mode the caller already trimmed input
+        # to just the *new* context + new pred latents (typically 1 + 1 for
+        # sequential decoding); the cached_len lives in kv_cache.
+        # Per-MCMC-step: select this step's sub-cache (context K/V depends on
+        # the MCMC step because context attends the time-embedding token).
+        step_layers = None
+        if kv_cache is not None:
+            step_layers = kv_cache.layers_for_step(mcmc_step)
+        is_decode = (step_layers is not None and step_layers[0].cached_len > 0)
+
+        # Shape invariant for dense_token / mtp_mcmc (prefill / no-cache only).
+        if not is_decode and pred_len != context_len:
             raise ValueError(
                 f"block_mode={block_mode!r} requires symmetric context/pred layout, "
                 f"got context_len={context_len}, pred_len={pred_len}. "
                 f"Non-symmetric block prediction will be enabled by block_mode='blockwise' "
                 f"once implemented."
             )
+        if is_decode and (context_len != 1 or pred_len != 1):
+            raise NotImplementedError(
+                "KV cache decode currently supports only n_new_ctx=1 and K_new=1 "
+                f"(sequential decoding); got context_len={context_len}, pred_len={pred_len}."
+            )
+
         _bsz = embeddings.shape[0]
         mcmc_step = torch.full(size=(_bsz,), fill_value=mcmc_step, device=embeddings.device, dtype=torch.long)
         time_embeddings = self.time_embeddings(mcmc_step).unsqueeze(dim=1)  # (B, 1, D)
-        embeddings = torch.cat((time_embeddings, embeddings), dim=1)  # (B, 1+S+K, D)
+        embeddings = torch.cat((time_embeddings, embeddings), dim=1)  # (B, 1+S+K, D) or (B, 3, D) decode
 
         self.freqs_cis = self.freqs_cis.to(embeddings.device)
 
-        # Rotary length for the symmetric EBT layout: context_with_time + 1
-        # extra slot for the pred superdiagonal shift.
-        legacy_seqlen = context_len + 2
-        required_length = start_pos + legacy_seqlen
-        if required_length > self.freqs_cis.shape[0]:
-            new_freqs_cis = precompute_freqs_cis(
-                self.params.dim // self.params.n_heads,
-                required_length,
-            ).to(embeddings.device)
-            self.freqs_cis = new_freqs_cis
+        if is_decode:
+            # Effective context size after this call appends the new ctx token.
+            cached_len_pre = step_layers[0].cached_len
+            S_total = cached_len_pre + context_len  # = cached_len_pre + 1
+            max_pos_needed = S_total + pred_len     # = S_total + 1
+            required_length = max_pos_needed + 1
+            if required_length > self.freqs_cis.shape[0]:
+                self.freqs_cis = precompute_freqs_cis(
+                    self.params.dim // self.params.n_heads,
+                    required_length,
+                ).to(embeddings.device)
 
-        freqs_cis = self.freqs_cis[start_pos : start_pos + legacy_seqlen]
-
-        mask = None
-        if legacy_seqlen > 1:
-            mask = torch.full((legacy_seqlen, legacy_seqlen), float("-inf"), device=embeddings.device)
-            mask = torch.triu(mask, diagonal=1)
-            mask = mask.type_as(embeddings)
-
-        for layer in self.layers:
-            embeddings = layer(
-                embeddings,
-                start_pos,
-                freqs_cis,
-                mask,
-                context_len=context_len,
-                pred_len=pred_len,
-                block_mode=block_mode,
+            # RoPE positions for the *new* tokens in this call's input:
+            #   index 0 (time)     -> position 0
+            #   index 1 (new ctx)  -> position S_total      (= cached_len_pre + 1)
+            #   index 2 (new pred) -> position S_total + 1  (= cached_len_pre + 2)
+            pos_indices = torch.tensor(
+                [0, S_total, S_total + 1], dtype=torch.long, device=embeddings.device
             )
+            freqs_cis_new = self.freqs_cis.index_select(0, pos_indices)
+            mask_for_decode = None  # decode path builds its own causal mask
+
+            for i, layer in enumerate(self.layers):
+                embeddings = layer(
+                    embeddings,
+                    start_pos,
+                    freqs_cis_new,
+                    mask_for_decode,
+                    context_len=context_len,
+                    pred_len=pred_len,
+                    block_mode=block_mode,
+                    kv_cache_layer=step_layers[i],
+                )
+        else:
+            # Prefill / no-cache path: original code, optionally passing the
+            # cache layer (Attention writes context K/V at the end).
+            legacy_seqlen = context_len + 2
+            required_length = start_pos + legacy_seqlen
+            if required_length > self.freqs_cis.shape[0]:
+                new_freqs_cis = precompute_freqs_cis(
+                    self.params.dim // self.params.n_heads,
+                    required_length,
+                ).to(embeddings.device)
+                self.freqs_cis = new_freqs_cis
+
+            freqs_cis = self.freqs_cis[start_pos : start_pos + legacy_seqlen]
+
+            mask = None
+            if legacy_seqlen > 1:
+                mask = torch.full((legacy_seqlen, legacy_seqlen), float("-inf"), device=embeddings.device)
+                mask = torch.triu(mask, diagonal=1)
+                mask = mask.type_as(embeddings)
+
+            for i, layer in enumerate(self.layers):
+                kv_cache_layer = step_layers[i] if step_layers is not None else None
+                embeddings = layer(
+                    embeddings,
+                    start_pos,
+                    freqs_cis,
+                    mask,
+                    context_len=context_len,
+                    pred_len=pred_len,
+                    block_mode=block_mode,
+                    kv_cache_layer=kv_cache_layer,
+                )
         embeddings = self.norm(embeddings)
         embeddings = embeddings[:, 1:]  # remove time embedding
         context_hidden = embeddings[:, :context_len]

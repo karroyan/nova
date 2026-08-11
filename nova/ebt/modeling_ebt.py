@@ -177,10 +177,19 @@ class EBT_NLP(LightningModule):
             
         return predicted_tokens, energy_preds, predicted_tokens_for_loss
 
-    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, block_size = None): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
+    def forward(self, x, start_pos = 0, learning = True, return_raw_logits = False, replay_buffer_logits = None, no_randomness = True, block_size = None, kv_cache = None): # accepts input_ids as input; a lot of the logic here is just for S2 params, see pseudocode in paper for a more concise view of how this works. it can be < 10 LOC
         real_embeddings_input = self.embeddings(x)
         batch_size = x.shape[0]
         seq_length = x.shape[1]
+        # KV cache (dense_token / mtp_mcmc inference). When the cache already
+        # has context (decode mode), the input x carries only the *new*
+        # context token(s); the symmetric (S=K) layout no longer applies and
+        # we force block_size=1 for sequential decoding.
+        is_decode_with_cache = (
+            kv_cache is not None
+            and kv_cache.cached_len > 0
+            and self._block_mode in ("dense_token", "mtp_mcmc")
+        )
         if block_size is None:
             # Default block_size differs by block_mode:
             #   * dense_token / mtp_mcmc: legacy symmetric layout, defaults
@@ -189,7 +198,9 @@ class EBT_NLP(LightningModule):
             #     the inference C+K layout (training uses
             #     forward_explicit_block_latent_logits directly), so the
             #     natural default is K=1 (sequential decoding).
-            if self._block_mode in EXPLICIT_BLOCK_LATENT_MODES:
+            if is_decode_with_cache:
+                block_size = 1
+            elif self._block_mode in EXPLICIT_BLOCK_LATENT_MODES:
                 block_size = getattr(self.hparams, "block_size", 1)
             else:
                 block_size = getattr(self.hparams, "block_size", seq_length)
@@ -207,13 +218,18 @@ class EBT_NLP(LightningModule):
         #     (K=1) and direct_block (K>1) inference. Training does NOT call
         #     forward(); it goes through forward_explicit_block_latent_logits.
         if self._block_mode in ("dense_token", "mtp_mcmc"):
-            if block_size != seq_length:
+            if (not is_decode_with_cache) and block_size != seq_length:
                 raise NotImplementedError(
                     f"EBT_NLP.forward with block_size != seq_length is not supported under "
                     f"block_mode={self._block_mode!r}; this path requires the 'blockwise' "
                     f"block_mode which is not implemented yet. Use sequential inference, "
                     f"or train a blockwise-mode checkpoint to enable non-symmetric block "
                     f"prediction. Got block_size={block_size}, seq_length={seq_length}."
+                )
+            if is_decode_with_cache and (seq_length != 1 or block_size != 1):
+                raise NotImplementedError(
+                    "KV cache decode currently expects seq_length=1 and block_size=1 "
+                    f"(sequential decoding); got seq_length={seq_length}, block_size={block_size}."
                 )
         elif self._block_mode in EXPLICIT_BLOCK_LATENT_MODES:
             ebt_type = getattr(self.hparams, "ebt_type", "default")
@@ -247,7 +263,19 @@ class EBT_NLP(LightningModule):
             alpha = low + torch.rand_like(expanded_alpha) * (high - low)
 
         langevin_dynamics_noise_std = torch.clamp(self.langevin_dynamics_noise_std, min=0.000001)
-        predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=block_size) # B, K, V
+        if is_decode_with_cache:
+            # RNG-compat: in decode mode `block_size == 1`, but the matching
+            # no-cache call at the same absolute position would corrupt over
+            # `(B, cached_len + 1, V)` entries. To keep generation byte-equal
+            # to no-cache (so cache vs no-cache outputs are identical given the
+            # same seed), allocate the *full* noise tensor and then slice the
+            # last row. This trades a small amount of wasted compute for
+            # end-to-end determinism w.r.t. the no-cache baseline.
+            full_target = kv_cache.cached_len + block_size  # = effective_S_total
+            full_noise = self.corrupt_embeddings(real_embeddings_input, target_length=full_target)  # (B, S_total, V)
+            predicted_tokens = full_noise[:, -block_size:, :].contiguous()  # (B, 1, V)
+        else:
+            predicted_tokens = self.corrupt_embeddings(real_embeddings_input, target_length=block_size) # B, K, V
         if replay_buffer_logits is not None: # using replay buffer, use the logits instead of corruption
             if block_size != seq_length:
                 raise NotImplementedError("replay_buffer_logits path only supports block_size == seq_length")
@@ -266,6 +294,7 @@ class EBT_NLP(LightningModule):
             no_randomness=no_randomness,
             alpha=alpha,
             langevin_dynamics_noise_std=langevin_dynamics_noise_std,
+            kv_cache=kv_cache,
         )
         return predicted_distributions, predicted_energies
 
@@ -307,6 +336,7 @@ class EBT_NLP(LightningModule):
         mcmc_steps=None,
         return_pred_hidden=False,
         return_context_hidden=False,
+        kv_cache=None,
     ):
         predicted_distributions = []
         predicted_energies = []
@@ -338,8 +368,19 @@ class EBT_NLP(LightningModule):
             optimize_mask_float = optimize_mask.to(dtype=predicted_tokens.dtype)
             fixed_logits = predicted_tokens.detach()
 
+        # Snapshot each MCMC step's sub-cache length at the start of this outer
+        # step so every MCMC inner iteration sees the same baseline (the prior
+        # outer steps' cached context). Each iteration rebuilds its own step's
+        # new-ctx K/V idempotently on top of the snapshot. Sub-caches are
+        # per-MCMC-step because context K/V depends on the time-embedding token.
+        kv_cache_snapshot = None
+        if kv_cache is not None:
+            kv_cache_snapshot = {s: kv_cache.cached_len_for_step(s) for s in set(mcmc_steps)}
+
         with torch.set_grad_enabled(True):
             for i, mcmc_step in enumerate(mcmc_steps):
+                if kv_cache is not None:
+                    kv_cache.reset_step_to(mcmc_step, kv_cache_snapshot[mcmc_step])
                 if self.hparams.no_mcmc_detach:
                     predicted_tokens.requires_grad_().reshape(batch_size, seq_length, self.vocab_size) # B, S, V
                 else: # default, do detach
@@ -373,6 +414,8 @@ class EBT_NLP(LightningModule):
                     pred_len=predicted_embeddings.shape[1],
                     block_mode=self._block_mode,
                 )
+                if kv_cache is not None:
+                    base_transformer_kwargs["kv_cache"] = kv_cache
                 energy_preds = self.transformer(
                     all_embeddings,
                     **base_transformer_kwargs,
@@ -409,6 +452,8 @@ class EBT_NLP(LightningModule):
                     predicted_tokens = torch.where(optimize_mask_bool, predicted_tokens, fixed_logits)
 
                 if need_post_update_hidden:
+                    if kv_cache is not None:
+                        kv_cache.reset_step_to(mcmc_step, kv_cache_snapshot[mcmc_step])
                     post_update_pred_embeddings = self._logits_to_pred_embeddings(predicted_tokens, mcmc_step)
                     post_update_all_embeddings = torch.cat((real_embeddings_input, post_update_pred_embeddings), dim=1)
                     post_transformer_kwargs = dict(base_transformer_kwargs)

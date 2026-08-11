@@ -341,7 +341,16 @@ def main(args):
         #     pretrained_hparams["modality"] = "VID" # this is just to test old models with a refactor of CV -> VID
 
         model = ModelTrainer(pretrained_hparams)
-        model.load_state_dict(checkpoint['state_dict'])
+        # strict=False: older checkpoints predate (a) the explicit-block-latent
+        # heads (blockwise_joint_head, block_latent_token_head), and (b) the
+        # superdiag_rows/cols registered buffers in Attention. Both are safe to
+        # initialize fresh when running dense_token / mtp_mcmc sequential
+        # inference (the heads are unused; the buffers are deterministic arange).
+        load_result = model.load_state_dict(checkpoint['state_dict'], strict=False)
+        if load_result.missing_keys:
+            print(f"[ckpt] missing keys (using freshly-initialized values): {len(load_result.missing_keys)} entries; e.g. {load_result.missing_keys[:3]}")
+        if load_result.unexpected_keys:
+            print(f"[ckpt] unexpected keys (ignored): {len(load_result.unexpected_keys)} entries; e.g. {load_result.unexpected_keys[:3]}")
         model.eval()
         model_trainer = ModelTrainer(args, trained_model=model.model) # need to use args as we have to use the model most recently passed in for inference
 
@@ -858,6 +867,8 @@ if __name__ == '__main__':
     parser.add_argument("--infer_block_init_logit_scale", help="[Inference] Initial one-hot logit scale used to initialize block refinement logits.", type=float, default=8.0)
 
     parser.add_argument("--infer_block_diagnose", help="[Inference] Print blockwise refine diagnostics (ids/logit delta/energy/grad norm).", action="store_true", default=False)
+
+    parser.add_argument("--infer_use_kv_cache", help="[Inference] Enable KV cache for sequential decoding (EBT dense_token / mtp_mcmc only). Reduces decode time from O(N^3) to O(N^2). Ignored for advanced inference, logprobs, or block_size > 1.", action="store_true", default=False)
 
     # VID INFERENCE ########################################################################
 
